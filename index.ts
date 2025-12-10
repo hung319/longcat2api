@@ -14,21 +14,28 @@ function log(tag: string, ...args: any[]) {
   }
 }
 
-// --- Headers ---
+// --- Headers (Match exactly with CURL) ---
 const HEADERS = {
   "authority": "longcat.chat",
   "accept": "text/event-stream,application/json",
   "accept-language": "vi-VN,vi;q=0.9",
   "content-type": "application/json",
+  // Cookie lấy từ env, nếu user quên set thì để rỗng (sẽ lỗi auth)
   "cookie": process.env.LONGCAT_COOKIE || "",
-  "m-appkey": process.env.LONGCAT_APPKEY || "",
-  "m-traceid": process.env.LONGCAT_TRACEID || "",
+  "m-appkey": process.env.LONGCAT_APPKEY || "fe_com.sankuai.friday.fe.longcat",
+  "m-traceid": process.env.LONGCAT_TRACEID || "-5919502901649396665",
   "origin": "https://longcat.chat",
   "referer": "https://longcat.chat/t",
-  "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+  "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
+  "sec-ch-ua-mobile": "?1",
+  "sec-ch-ua-platform": '"Android"',
   "sec-fetch-dest": "empty",
   "sec-fetch-mode": "cors",
   "sec-fetch-site": "same-origin",
+  "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+  // Hai header này cực kỳ quan trọng, thiếu là bị đóng kết nối
+  "x-client-language": "en",
+  "x-requested-with": "XMLHttpRequest" 
 };
 
 const AVAILABLE_MODELS = [
@@ -50,7 +57,12 @@ function generateId() {
   return `chatcmpl-${Math.random().toString(36).substring(2, 10)}`;
 }
 
-// --- FIX QUAN TRỌNG Ở ĐÂY ---
+// Generate random 8-digit integer ID like "32509700"
+function generateMsgId() {
+  return Math.floor(10000000 + Math.random() * 90000000);
+}
+
+// --- Payload Transformer (Strict Match CURL) ---
 function transformPayload(reqBody: any) {
   const lastMessage = reqBody.messages[reqBody.messages.length - 1];
   const modelName = reqBody.model ? reqBody.model.toLowerCase() : "longcat-flash";
@@ -58,28 +70,29 @@ function transformPayload(reqBody: any) {
   const isThinking = modelName.includes("think") || modelName.includes("reason");
   const isSearch = modelName.includes("search") || modelName.includes("online");
 
-  const timestamp = Date.now();
+  // Giả lập 2 ID ngẫu nhiên
+  const userMsgId = generateMsgId();
+  const assistantMsgId = generateMsgId();
 
   return {
     content: lastMessage.content || "",
     agentId: "1",
     messages: [
-      // 1. Tin nhắn của User
       {
         role: "user",
         events: [
           { type: "userMsg", content: lastMessage.content || "", status: "FINISHED" }
         ],
         chatStatus: "FINISHED",
-        messageId: timestamp,
+        messageId: userMsgId,
         idType: "custom"
       },
-      // 2. [FIX] Phải thêm Placeholder cho Assistant thì Longcat mới stream
+      // Placeholder Assistant (Bắt buộc)
       {
         role: "assistant",
         events: [],
-        chatStatus: "LOADING", 
-        messageId: timestamp + 1,
+        chatStatus: "LOADING",
+        messageId: assistantMsgId,
         idType: "custom"
       }
     ],
@@ -95,6 +108,7 @@ const server = serve({
   async fetch(req) {
     const url = new URL(req.url);
 
+    // CORS
     if (req.method === "OPTIONS") {
       return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*", "Access-Control-Allow-Methods": "*" } });
     }
@@ -110,7 +124,9 @@ const server = serve({
         const isStream = body.stream === true;
         const model = body.model || "longcat-flash"; 
 
-        log("REQ", `Model: ${model} | Stream: ${isStream} | Expecting Reply...`);
+        log("REQ", `Model: ${model} | Stream: ${isStream} | Sending to Longcat...`);
+        // Debug payload gửi đi
+        // log("PAYLOAD", JSON.stringify(longcatPayload));
 
         const response = await fetch(TARGET_URL, {
           method: "POST",
@@ -118,9 +134,11 @@ const server = serve({
           body: JSON.stringify(longcatPayload),
         });
 
+        log("RESP", `Status: ${response.status} | Content-Type: ${response.headers.get("content-type")}`);
+
         if (!response.ok) {
           const text = await response.text();
-          log("UPSTREAM_FAIL", `${response.status} - ${text.substring(0, 100)}`);
+          log("UPSTREAM_FAIL", `${response.status} - ${text.substring(0, 200)}`);
           return createErrorResponse(response.status, `Upstream Error: ${response.statusText}`);
         }
 
@@ -146,11 +164,14 @@ const server = serve({
                   choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]
               })}\n\n`));
               
-              log("STREAM", "Connected & Waiting for data...");
+              log("STREAM", "Connected, waiting for events...");
 
               while (true) {
                 const { done, value } = await reader.read();
-                if (done) break;
+                if (done) {
+                    log("STREAM", "Upstream closed connection");
+                    break;
+                }
 
                 const chunkText = decoder.decode(value, { stream: true });
                 buffer += chunkText;
@@ -165,9 +186,11 @@ const server = serve({
                     try {
                       const data = JSON.parse(jsonStr);
                       const event = data.event;
-                      if (!event) continue;
+                      
+                      // Log để debug xem có nhận được data thật không
+                      // if (event) log("EVENT_RX", event.type);
 
-                      // log("EVENT", event.type); // Uncomment nếu muốn xem chi tiết từng event
+                      if (!event) continue;
 
                       let deltaPayload: any = {};
                       let hasUpdate = false;
@@ -227,13 +250,13 @@ const server = serve({
                           if (searchLog) {
                               deltaPayload = { reasoning_content: searchLog };
                               hasUpdate = true;
-                              log("SEARCH", "Results found");
+                              log("SEARCH", "Results processed");
                           }
                       }
 
                       // 4. Finish Logic
                       else if (event.type === "finish") {
-                        log("STREAM", "Finished successfully");
+                        log("STREAM", "Finished [DONE]");
                         await writer.write(encoder.encode(`data: ${JSON.stringify({
                             id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: model,
                             choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
@@ -255,7 +278,7 @@ const server = serve({
             } catch (err) {
               log("STREAM_ERR", err);
             } finally {
-              log("STREAM", "Closed");
+              log("STREAM", "Writer closed");
               await writer.close();
             }
           })();
@@ -275,4 +298,4 @@ const server = serve({
   },
 });
 
-console.log(`🦊 Bun Proxy running on http://localhost:${PORT}`);
+console.log(`🦊 Bun Proxy (Clone CURL) running on http://localhost:${PORT}`);
