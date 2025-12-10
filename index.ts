@@ -5,9 +5,8 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.SERVER_API_KEY;
 const TARGET_URL = "https://longcat.chat/api/v1/chat-completion-oversea";
 
-// --- Debug Configuration ---
-const DEBUG = true; // Bật cờ này để xem log
-
+// --- Debug ---
+const DEBUG = true;
 function log(tag: string, ...args: any[]) {
   if (DEBUG) {
     const time = new Date().toISOString().split("T")[1].replace("Z", "");
@@ -51,6 +50,7 @@ function generateId() {
   return `chatcmpl-${Math.random().toString(36).substring(2, 10)}`;
 }
 
+// --- FIX QUAN TRỌNG Ở ĐÂY ---
 function transformPayload(reqBody: any) {
   const lastMessage = reqBody.messages[reqBody.messages.length - 1];
   const modelName = reqBody.model ? reqBody.model.toLowerCase() : "longcat-flash";
@@ -58,17 +58,28 @@ function transformPayload(reqBody: any) {
   const isThinking = modelName.includes("think") || modelName.includes("reason");
   const isSearch = modelName.includes("search") || modelName.includes("online");
 
+  const timestamp = Date.now();
+
   return {
     content: lastMessage.content || "",
     agentId: "1",
     messages: [
+      // 1. Tin nhắn của User
       {
         role: "user",
         events: [
           { type: "userMsg", content: lastMessage.content || "", status: "FINISHED" }
         ],
         chatStatus: "FINISHED",
-        messageId: Date.now(),
+        messageId: timestamp,
+        idType: "custom"
+      },
+      // 2. [FIX] Phải thêm Placeholder cho Assistant thì Longcat mới stream
+      {
+        role: "assistant",
+        events: [],
+        chatStatus: "LOADING", 
+        messageId: timestamp + 1,
         idType: "custom"
       }
     ],
@@ -78,31 +89,20 @@ function transformPayload(reqBody: any) {
   };
 }
 
-// --- Server ---
+// --- Server Logic ---
 const server = serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url);
 
-    // CORS
     if (req.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Headers": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        },
-      });
+      return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*", "Access-Control-Allow-Methods": "*" } });
     }
 
-    // Models Endpoint
-    if (url.pathname === "/v1/models" && req.method === "GET") {
-      return new Response(JSON.stringify({ object: "list", data: AVAILABLE_MODELS }), {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
+    if (url.pathname === "/v1/models") {
+      return new Response(JSON.stringify({ object: "list", data: AVAILABLE_MODELS }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
     }
 
-    // Chat Endpoint
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       try {
         const body = await req.json() as any;
@@ -110,7 +110,7 @@ const server = serve({
         const isStream = body.stream === true;
         const model = body.model || "longcat-flash"; 
 
-        log("REQ", `Model: ${model} | Stream: ${isStream}`);
+        log("REQ", `Model: ${model} | Stream: ${isStream} | Expecting Reply...`);
 
         const response = await fetch(TARGET_URL, {
           method: "POST",
@@ -141,12 +141,12 @@ const server = serve({
               let lastThinking = "";
 
               // Send Initial Chunk
-              const startChunk = {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({
                   id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: model,
                   choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]
-              };
-              await writer.write(encoder.encode(`data: ${JSON.stringify(startChunk)}\n\n`));
-              log("STREAM", "Started - Sent Initial Chunk");
+              })}\n\n`));
+              
+              log("STREAM", "Connected & Waiting for data...");
 
               while (true) {
                 const { done, value } = await reader.read();
@@ -167,46 +167,34 @@ const server = serve({
                       const event = data.event;
                       if (!event) continue;
 
-                      // Log Raw Event để debug
-                      // log("RAW_EVENT", `${event.type} -> ContentLen: ${event.content ? event.content.length : 0}`);
+                      // log("EVENT", event.type); // Uncomment nếu muốn xem chi tiết từng event
 
                       let deltaPayload: any = {};
                       let hasUpdate = false;
 
-                      // === LOGIC TÍNH DELTA ===
-                      
-                      // 1. Content
-                      if (event.type === "content") {
-                          const fullContent = event.content || "";
+                      // 1. Content Logic
+                      if (event.type === "content" && typeof event.content === "string") {
+                          const fullContent = event.content;
                           let delta = "";
                           
-                          // Log logic tính toán
-                          // log("CALC", `Last: ${lastContent.length} | New: ${fullContent.length}`);
-
-                          if (fullContent.length < lastContent.length) {
-                             log("RESET", "New content shorter than old content. Resetting.");
-                             lastContent = "";
-                          }
+                          if (fullContent.length < lastContent.length) lastContent = "";
 
                           if (fullContent.startsWith(lastContent)) {
                               delta = fullContent.substring(lastContent.length);
                           } else {
-                              // Nếu không khớp prefix, có thể server đã sửa lại câu. Gửi lại phần khác biệt hoặc gửi hết.
-                              log("MISMATCH", "Content prefix mismatch. Sending full as delta (risky).");
-                              delta = fullContent; // Fallback
+                              delta = fullContent; 
                           }
 
                           if (delta) {
                               lastContent = fullContent;
                               deltaPayload = { content: delta };
                               hasUpdate = true;
-                              // log("DELTA_OUT", delta);
                           }
                       }
 
-                      // 2. Thinking
-                      else if (event.type === "think") {
-                          const fullThinking = event.content || "";
+                      // 2. Thinking Logic
+                      else if (event.type === "think" && typeof event.content === "string") {
+                          const fullThinking = event.content;
                           let delta = "";
                           
                           if (fullThinking.length < lastThinking.length) lastThinking = "";
@@ -223,47 +211,44 @@ const server = serve({
                               hasUpdate = true;
                           }
                       }
-                      
-                      // 3. Search
+
+                      // 3. Search Logic
                       else if (event.type === "search" && event.content) {
-                          // ... (Search logic keep same)
                           const searchContent = event.content;
                           let searchLog = "";
-                          if (searchContent.query) searchLog = `\n🔍 **Searching:** ${searchContent.query}\n\n`;
+                          if (searchContent.query) searchLog = `\n🔍 **Searching:** *${searchContent.query}*\n\n`;
                           else if (Array.isArray(searchContent.resultList)) {
-                              searchContent.resultList.slice(0,3).forEach((i:any, idx:number) => searchLog += `> ${idx+1}. [${i.title}](${i.url})\n`);
-                              searchLog += "\n---\n";
+                              searchContent.resultList.slice(0,5).forEach((item: any, idx: number) => {
+                                  const snippet = item.snippet ? ` - *"${item.snippet.substring(0, 60)}..."*` : "";
+                                  searchLog += `> ${idx + 1}. [${item.title || "Link"}](${item.url})${snippet}\n`;
+                              });
+                              searchLog += "\n---\n\n";
                           }
                           if (searchLog) {
                               deltaPayload = { reasoning_content: searchLog };
                               hasUpdate = true;
-                              log("SEARCH", "Found search event");
+                              log("SEARCH", "Results found");
                           }
                       }
 
-                      // 4. Finish
+                      // 4. Finish Logic
                       else if (event.type === "finish") {
-                        log("STREAM", "Received FINISH event");
-                        const endChunk = {
+                        log("STREAM", "Finished successfully");
+                        await writer.write(encoder.encode(`data: ${JSON.stringify({
                             id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: model,
                             choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
-                        };
-                        await writer.write(encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
+                        })}\n\n`));
                         await writer.write(encoder.encode("data: [DONE]\n\n"));
                         return;
                       }
 
                       if (hasUpdate) {
-                          const chunk = {
+                          await writer.write(encoder.encode(`data: ${JSON.stringify({
                             id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: model,
                             choices: [{ index: 0, delta: deltaPayload, finish_reason: null }]
-                          };
-                          await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                          })}\n\n`));
                       }
-
-                    } catch (e) {
-                      log("PARSE_ERR", jsonStr.substring(0, 50));
-                    }
+                    } catch (e) {}
                   }
                 }
               }
@@ -275,12 +260,9 @@ const server = serve({
             }
           })();
 
-          return new Response(readable, {
-            headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*" },
-          });
+          return new Response(readable, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*" } });
         }
         
-        // Non-stream fallback (bỏ qua cho gọn để tập trung debug stream)
         return new Response(JSON.stringify({choices:[]}));
 
       } catch (error) {
@@ -293,4 +275,4 @@ const server = serve({
   },
 });
 
-console.log(`🦊 DEBUG Proxy running on http://localhost:${PORT}`);
+console.log(`🦊 Bun Proxy running on http://localhost:${PORT}`);
