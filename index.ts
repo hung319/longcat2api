@@ -33,7 +33,7 @@ const HEADERS = {
   "sec-fetch-site": "same-origin",
 };
 
-// --- Available Models (Official Only) ---
+// --- Available Models ---
 const AVAILABLE_MODELS = [
   {
     id: "longcat-flash",
@@ -50,7 +50,7 @@ const AVAILABLE_MODELS = [
     created: 1700000000,
     owned_by: "longcat",
     permission: [],
-    root: "longcat-thinking", // Triggers Reasoning features
+    root: "longcat-thinking",
     parent: null,
   },
   {
@@ -59,7 +59,7 @@ const AVAILABLE_MODELS = [
     created: 1700000000,
     owned_by: "longcat",
     permission: [],
-    root: "longcat-search", // Triggers Web Search features
+    root: "longcat-search",
     parent: null,
   }
 ];
@@ -81,7 +81,7 @@ function transformPayload(reqBody: OpenAIRequest) {
   const lastMessage = reqBody.messages[reqBody.messages.length - 1];
   const modelName = reqBody.model.toLowerCase();
   
-  // Logic mapping model name -> Feature flags
+  // Logic: Mapping model name -> Features
   const isThinking = modelName.includes("think") || modelName.includes("reason");
   const isSearch = modelName.includes("search") || modelName.includes("online");
 
@@ -126,28 +126,21 @@ const server = serve({
       });
     }
 
-    // 2. Auth Check (Skip for root)
     const authHeader = req.headers.get("Authorization");
     const isAuth = !API_KEY || (authHeader && authHeader.replace("Bearer ", "") === API_KEY);
 
-    // 3. Routes
-    
-    // GET / (Health)
+    // 2. Routes
     if (url.pathname === "/") return new Response("Longcat OpenAI Proxy 🚀");
 
-    // GET /v1/models (List Models)
+    // List Models
     if (url.pathname === "/v1/models" && req.method === "GET") {
       if (!isAuth) return createErrorResponse(401, "Invalid API Key");
-      
-      return new Response(JSON.stringify({
-        object: "list",
-        data: AVAILABLE_MODELS
-      }), {
+      return new Response(JSON.stringify({ object: "list", data: AVAILABLE_MODELS }), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
 
-    // POST /v1/chat/completions (Chat)
+    // Chat Completions
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       if (!isAuth) return createErrorResponse(401, "Invalid API Key");
 
@@ -208,24 +201,32 @@ const server = serve({
                       let deltaPayload: any = {};
                       let hasUpdate = false;
 
-                      // A. Search -> Reasoning
+                      // === A. Search Event ===
                       if (event.type === "search" && event.content) {
                           const searchContent = event.content;
                           let searchLog = "";
+
+                          // 1. Query
                           if (searchContent.query) {
-                              searchLog = `\n> 🔍 **Searching:** ${searchContent.query}\n\n`;
-                          } else if (Array.isArray(searchContent.resultList)) {
+                              searchLog = `\n> 🔍 **Searching:** *${searchContent.query}*\n\n`;
+                          } 
+                          // 2. Results (Added Snippet support based on your file)
+                          else if (Array.isArray(searchContent.resultList)) {
+                              searchLog += `> **Found ${searchContent.resultList.length} results:**\n`;
                               searchContent.resultList.slice(0, 5).forEach((item: any, idx: number) => {
-                                  searchLog += `> ${idx + 1}. [${item.title}](${item.url})\n`;
+                                  const snippet = item.snippet ? ` - *"${item.snippet.substring(0, 100)}..."*` : "";
+                                  searchLog += `> ${idx + 1}. [${item.title || "Link"}](${item.url})${snippet}\n`;
                               });
-                              searchLog += "\n";
+                              searchLog += "\n---\n\n";
                           }
+
                           if (searchLog) {
                               deltaPayload = { reasoning_content: searchLog };
                               hasUpdate = true;
                           }
                       }
-                      // B. Thinking -> Reasoning
+                      
+                      // === B. Thinking Event ===
                       else if (event.type === "think" && event.content) {
                           const delta = event.content.startsWith(lastThinking) 
                               ? event.content.substring(lastThinking.length) 
@@ -236,7 +237,8 @@ const server = serve({
                               hasUpdate = true;
                           }
                       }
-                      // C. Content
+
+                      // === C. Content Event ===
                       else if (event.type === "content" && event.content) {
                           const delta = event.content.startsWith(lastContent) 
                               ? event.content.substring(lastContent.length) 
@@ -247,7 +249,8 @@ const server = serve({
                               hasUpdate = true;
                           }
                       }
-                      // D. Finish
+
+                      // === D. Finish ===
                       else if (event.type === "finish") {
                          const endChunk = {
                           id: chatId,
@@ -289,38 +292,32 @@ const server = serve({
         
         // --- Non-Stream Handling ---
         else {
-          const reader = response.body?.getReader();
-          const decoder = new TextDecoder();
-          let fullResponseText = "";
-          
-          if (reader) {
-             while (true) {
-               const { done, value } = await reader.read();
-               if (done) break;
-               const chunkStr = decoder.decode(value);
-               const lines = chunkStr.split("\n");
-               for (const line of lines) {
-                  if (line.trim().startsWith("data:")) {
-                     try {
-                       const data = JSON.parse(line.replace("data:", "").trim());
-                       if (data.event?.type === "content") fullResponseText = data.event.content;
-                     } catch(e) {}
-                  }
-               }
-             }
-          }
-          return new Response(JSON.stringify({
-            id: generateId(),
-            object: "chat.completion",
-            created: Math.floor(Date.now() / 1000),
-            model: model,
-            choices: [{
-              index: 0,
-              message: { role: "assistant", content: fullResponseText },
-              finish_reason: "stop"
-            }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-          }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+            // Simplified Non-stream handler
+            const reader = response.body?.getReader();
+            const decoder = new TextDecoder();
+            let fullResponseText = "";
+            if (reader) {
+                while(true) {
+                    const {done, value} = await reader.read();
+                    if(done) break;
+                    const lines = decoder.decode(value).split("\n");
+                    for(const line of lines) {
+                        if(line.startsWith("data:")) {
+                            try {
+                                const data = JSON.parse(line.replace("data:", "").trim());
+                                if(data.event?.type === "content") fullResponseText = data.event.content;
+                            } catch(e){}
+                        }
+                    }
+                }
+            }
+             return new Response(JSON.stringify({
+                id: generateId(),
+                object: "chat.completion",
+                created: Math.floor(Date.now() / 1000),
+                model: model,
+                choices: [{ index: 0, message: { role: "assistant", content: fullResponseText }, finish_reason: "stop" }]
+             }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
         }
 
       } catch (error) {
