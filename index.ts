@@ -33,35 +33,10 @@ const HEADERS = {
   "sec-fetch-site": "same-origin",
 };
 
-// --- Available Models ---
 const AVAILABLE_MODELS = [
-  {
-    id: "longcat-flash",
-    object: "model",
-    created: 1700000000,
-    owned_by: "longcat",
-    permission: [],
-    root: "longcat-flash",
-    parent: null,
-  },
-  {
-    id: "longcat-thinking",
-    object: "model",
-    created: 1700000000,
-    owned_by: "longcat",
-    permission: [],
-    root: "longcat-thinking",
-    parent: null,
-  },
-  {
-    id: "longcat-search",
-    object: "model",
-    created: 1700000000,
-    owned_by: "longcat",
-    permission: [],
-    root: "longcat-search",
-    parent: null,
-  }
+  { id: "longcat-flash", object: "model", created: 1700000000, owned_by: "longcat", permission: [], root: "longcat-flash", parent: null },
+  { id: "longcat-thinking", object: "model", created: 1700000000, owned_by: "longcat", permission: [], root: "longcat-thinking", parent: null },
+  { id: "longcat-search", object: "model", created: 1700000000, owned_by: "longcat", permission: [], root: "longcat-search", parent: null }
 ];
 
 // --- Helpers ---
@@ -76,12 +51,11 @@ function generateId() {
   return `chatcmpl-${Math.random().toString(36).substring(2, 10)}`;
 }
 
-// --- Transformer: OpenAI Messages -> Longcat Payload ---
+// --- Payload Transformer ---
 function transformPayload(reqBody: OpenAIRequest) {
   const lastMessage = reqBody.messages[reqBody.messages.length - 1];
   const modelName = reqBody.model.toLowerCase();
   
-  // Logic: Mapping model name -> Features
   const isThinking = modelName.includes("think") || modelName.includes("reason");
   const isSearch = modelName.includes("search") || modelName.includes("online");
 
@@ -115,7 +89,7 @@ const server = serve({
   async fetch(req) {
     const url = new URL(req.url);
 
-    // 1. CORS Preflight
+    // 1. CORS
     if (req.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -130,9 +104,8 @@ const server = serve({
     const isAuth = !API_KEY || (authHeader && authHeader.replace("Bearer ", "") === API_KEY);
 
     // 2. Routes
-    if (url.pathname === "/") return new Response("Longcat OpenAI Proxy 🚀");
+    if (url.pathname === "/") return new Response("Longcat Proxy Fixed 🛠️");
 
-    // List Models
     if (url.pathname === "/v1/models" && req.method === "GET") {
       if (!isAuth) return createErrorResponse(401, "Invalid API Key");
       return new Response(JSON.stringify({ object: "list", data: AVAILABLE_MODELS }), {
@@ -140,7 +113,6 @@ const server = serve({
       });
     }
 
-    // Chat Completions
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       if (!isAuth) return createErrorResponse(401, "Invalid API Key");
 
@@ -159,6 +131,7 @@ const server = serve({
         });
 
         if (!response.ok) {
+          console.error(`Upstream Error: ${response.status} - ${await response.text()}`);
           return createErrorResponse(response.status, `Upstream Error: ${response.statusText}`);
         }
 
@@ -178,6 +151,16 @@ const server = serve({
               let buffer = "";
               let lastContent = ""; 
               let lastThinking = "";
+              
+              // Gửi chunk mở đầu để Client biết kết nối OK
+              const startChunk = {
+                  id: chatId,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: model,
+                  choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]
+              };
+              await writer.write(encoder.encode(`data: ${JSON.stringify(startChunk)}\n\n`));
 
               while (true) {
                 const { done, value } = await reader.read();
@@ -197,61 +180,82 @@ const server = serve({
                       const event = data.event;
                       
                       if (!event) continue;
+                      
+                      // Debug log nhẹ để xem sự kiện gì đang về
+                      // console.log("Event Type:", event.type); 
 
                       let deltaPayload: any = {};
                       let hasUpdate = false;
 
-                      // === A. Search Event ===
-                      if (event.type === "search" && event.content) {
-                          const searchContent = event.content;
-                          let searchLog = "";
+                      // 1. Handle Content (Standard Chat)
+                      // Fix: Kiểm tra typeof string thay vì check truthy để ko bỏ qua chuỗi rỗng
+                      if (event.type === "content" && typeof event.content === "string") {
+                          const fullContent = event.content;
+                          let delta = "";
 
-                          // 1. Query
-                          if (searchContent.query) {
-                              searchLog = `\n> 🔍 **Searching:** *${searchContent.query}*\n\n`;
-                          } 
-                          // 2. Results (Added Snippet support based on your file)
-                          else if (Array.isArray(searchContent.resultList)) {
-                              searchLog += `> **Found ${searchContent.resultList.length} results:**\n`;
-                              searchContent.resultList.slice(0, 5).forEach((item: any, idx: number) => {
-                                  const snippet = item.snippet ? ` - *"${item.snippet.substring(0, 100)}..."*` : "";
-                                  searchLog += `> ${idx + 1}. [${item.title || "Link"}](${item.url})${snippet}\n`;
-                              });
-                              searchLog += "\n---\n\n";
+                          // Reset nếu nội dung mới ngắn hơn (rewrite)
+                          if (fullContent.length < lastContent.length) {
+                              lastContent = ""; 
                           }
 
-                          if (searchLog) {
-                              deltaPayload = { reasoning_content: searchLog };
-                              hasUpdate = true;
+                          if (fullContent.startsWith(lastContent)) {
+                              delta = fullContent.substring(lastContent.length);
+                          } else {
+                              delta = fullContent; // Fallback
                           }
-                      }
-                      
-                      // === B. Thinking Event ===
-                      else if (event.type === "think" && event.content) {
-                          const delta = event.content.startsWith(lastThinking) 
-                              ? event.content.substring(lastThinking.length) 
-                              : event.content;
+
                           if (delta) {
-                              lastThinking = event.content;
-                              deltaPayload = { reasoning_content: delta };
-                              hasUpdate = true;
-                          }
-                      }
-
-                      // === C. Content Event ===
-                      else if (event.type === "content" && event.content) {
-                          const delta = event.content.startsWith(lastContent) 
-                              ? event.content.substring(lastContent.length) 
-                              : event.content;
-                          if (delta) {
-                              lastContent = event.content;
+                              lastContent = fullContent;
                               deltaPayload = { content: delta };
                               hasUpdate = true;
                           }
                       }
 
-                      // === D. Finish ===
+                      // 2. Handle Thinking (If reasoning enabled)
+                      else if (event.type === "think" && typeof event.content === "string") {
+                          const fullThinking = event.content;
+                          let delta = "";
+                          
+                           if (fullThinking.length < lastThinking.length) {
+                              lastThinking = "";
+                          }
+
+                          if (fullThinking.startsWith(lastThinking)) {
+                              delta = fullThinking.substring(lastThinking.length);
+                          } else {
+                              delta = fullThinking;
+                          }
+
+                          if (delta) {
+                              lastThinking = fullThinking;
+                              deltaPayload = { reasoning_content: delta };
+                              hasUpdate = true;
+                          }
+                      }
+
+                      // 3. Handle Search
+                      else if (event.type === "search" && event.content) {
+                          const searchContent = event.content;
+                          let searchLog = "";
+
+                          if (searchContent.query) {
+                              searchLog = `\n> 🔍 **Searching:** *${searchContent.query}*\n\n`;
+                          } else if (Array.isArray(searchContent.resultList)) {
+                               searchContent.resultList.slice(0, 5).forEach((item: any, idx: number) => {
+                                  const snippet = item.snippet ? ` - *"${item.snippet.substring(0, 80)}..."*` : "";
+                                  searchLog += `> ${idx + 1}. [${item.title || "Link"}](${item.url})${snippet}\n`;
+                              });
+                              searchLog += "\n---\n\n";
+                          }
+                          if (searchLog) {
+                              deltaPayload = { reasoning_content: searchLog }; // Đẩy vào reasoning để không lẫn vào nội dung chính
+                              hasUpdate = true;
+                          }
+                      }
+
+                      // 4. Handle Finish
                       else if (event.type === "finish") {
+                        // Gửi tín hiệu dừng
                          const endChunk = {
                           id: chatId,
                           object: "chat.completion.chunk",
@@ -264,6 +268,7 @@ const server = serve({
                         return;
                       }
 
+                      // Gửi Data về Client
                       if (hasUpdate) {
                           const chunk = {
                             id: chatId,
@@ -274,7 +279,10 @@ const server = serve({
                           };
                           await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                       }
-                    } catch (e) {}
+
+                    } catch (e) {
+                         // console.error("Parse Error:", e);
+                    }
                   }
                 }
               }
@@ -290,12 +298,13 @@ const server = serve({
           });
         } 
         
-        // --- Non-Stream Handling ---
+        // --- Non-Stream Handling (Simplified) ---
         else {
-            // Simplified Non-stream handler
             const reader = response.body?.getReader();
             const decoder = new TextDecoder();
             let fullResponseText = "";
+            let fullReasoningText = "";
+            
             if (reader) {
                 while(true) {
                     const {done, value} = await reader.read();
@@ -306,6 +315,7 @@ const server = serve({
                             try {
                                 const data = JSON.parse(line.replace("data:", "").trim());
                                 if(data.event?.type === "content") fullResponseText = data.event.content;
+                                if(data.event?.type === "think") fullReasoningText = data.event.content;
                             } catch(e){}
                         }
                     }
@@ -316,11 +326,20 @@ const server = serve({
                 object: "chat.completion",
                 created: Math.floor(Date.now() / 1000),
                 model: model,
-                choices: [{ index: 0, message: { role: "assistant", content: fullResponseText }, finish_reason: "stop" }]
+                choices: [{ 
+                    index: 0, 
+                    message: { 
+                        role: "assistant", 
+                        content: fullResponseText,
+                        reasoning_content: fullReasoningText
+                    }, 
+                    finish_reason: "stop" 
+                }]
              }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
         }
 
       } catch (error) {
+        console.error("Internal Error:", error);
         return createErrorResponse(500, "Internal Server Error");
       }
     }
@@ -329,4 +348,4 @@ const server = serve({
   },
 });
 
-console.log(`🦊 Bun Longcat Proxy running on http://localhost:${PORT}`);
+console.log(`🦊 Bun Longcat Proxy Fixed running on http://localhost:${PORT}`);
