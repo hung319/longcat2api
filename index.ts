@@ -5,8 +5,8 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.SERVER_API_KEY;
 const TARGET_URL = "https://longcat.chat/api/v1/chat-completion-oversea";
 
-// --- Debug (Giữ lại để bắt lỗi) ---
-const DEBUG = true;
+// --- Debug ---
+const DEBUG = true; 
 function log(tag: string, ...args: any[]) {
   if (DEBUG) {
     const time = new Date().toISOString().split("T")[1].replace("Z", "");
@@ -14,17 +14,20 @@ function log(tag: string, ...args: any[]) {
   }
 }
 
-// --- Headers ---
+// --- HEADERS (COPY CHÍNH XÁC TỪ CURL) ---
 const HEADERS = {
   "authority": "longcat.chat",
   "accept": "text/event-stream,application/json",
   "accept-language": "vi-VN,vi;q=0.9",
   "content-type": "application/json",
+  // Cookie lấy từ env
   "cookie": process.env.LONGCAT_COOKIE || "",
-  "m-appkey": process.env.LONGCAT_APPKEY || "fe_com.sankuai.friday.fe.longcat",
+  "m-appkey": "fe_com.sankuai.friday.fe.longcat",
+  // TraceID có thể random hoặc lấy từ env
   "m-traceid": process.env.LONGCAT_TRACEID || "-5919502901649396665",
   "origin": "https://longcat.chat",
   "referer": "https://longcat.chat/t",
+  // Các header giả lập trình duyệt quan trọng
   "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
   "sec-ch-ua-mobile": "?1",
   "sec-ch-ua-platform": '"Android"',
@@ -32,8 +35,9 @@ const HEADERS = {
   "sec-fetch-mode": "cors",
   "sec-fetch-site": "same-origin",
   "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+  // Header xác định client
   "x-client-language": "en",
-  "x-requested-with": "XMLHttpRequest" 
+  "x-requested-with": "XMLHttpRequest"
 };
 
 const AVAILABLE_MODELS = [
@@ -42,10 +46,12 @@ const AVAILABLE_MODELS = [
   { id: "longcat-search", object: "model", created: 1700000000, owned_by: "longcat" }
 ];
 
+// --- Helpers ---
 function generateId() {
   return `chatcmpl-${Math.random().toString(36).substring(2, 10)}`;
 }
 
+// Tạo Message ID dạng số nguyên 8 chữ số (Giống CURL)
 function generateMsgId() {
   return Math.floor(10000000 + Math.random() * 90000000);
 }
@@ -71,7 +77,7 @@ function transformPayload(reqBody: any) {
         messageId: generateMsgId(),
         idType: "custom"
       },
-      // Placeholder Assistant (Bắt buộc để kích hoạt Stream)
+      // Placeholder Assistant bắt buộc
       {
         role: "assistant",
         events: [],
@@ -97,12 +103,12 @@ const server = serve({
       return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*", "Access-Control-Allow-Methods": "*" } });
     }
 
-    // 2. Models
+    // 2. Models Endpoint
     if (url.pathname === "/v1/models") {
       return new Response(JSON.stringify({ object: "list", data: AVAILABLE_MODELS }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
     }
 
-    // 3. Chat Completions
+    // 3. Chat Endpoint
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       try {
         const body = await req.json() as any;
@@ -110,7 +116,7 @@ const server = serve({
         const isStream = body.stream === true;
         const model = body.model || "longcat-flash"; 
 
-        log("REQ", `Model: ${model} | Stream: ${isStream} | Connecting to Longcat...`);
+        log("REQ", `Model: ${model} | Stream: ${isStream} | Connecting...`);
 
         const response = await fetch(TARGET_URL, {
           method: "POST",
@@ -120,7 +126,7 @@ const server = serve({
 
         if (!response.ok) {
           const text = await response.text();
-          log("FAIL", `Upstream: ${response.status} ${response.statusText}`);
+          log("FAIL", `Upstream: ${response.status} - ${text.substring(0, 100)}`);
           return new Response(JSON.stringify({ error: { message: `Upstream Error: ${response.status}`, type: "server_error" } }), { status: response.status, headers: { "Content-Type": "application/json" } });
         }
 
@@ -129,7 +135,7 @@ const server = serve({
         const decoder = new TextDecoder();
 
         // ==========================
-        // CASE 1: STREAMING (SSE)
+        // CASE 1: STREAMING
         // ==========================
         if (isStream) {
           const { readable, writable } = new TransformStream();
@@ -142,13 +148,11 @@ const server = serve({
               let lastContent = ""; 
               let lastThinking = "";
 
-              // Gửi chunk đầu tiên để Client không bị timeout
+              // Send Initial Chunk
               await writer.write(new TextEncoder().encode(`data: ${JSON.stringify({
                   id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: model,
                   choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]
               })}\n\n`));
-
-              log("STREAM", "Connected. Streaming data...");
 
               while (true) {
                 const { done, value } = await reader.read();
@@ -246,11 +250,13 @@ const server = serve({
         } 
         
         // ==========================
-        // CASE 2: NON-STREAM (Wait & Return JSON)
+        // CASE 2: NON-STREAM (FIXED)
         // ==========================
         else {
-            log("NON-STREAM", "Accumulating response...");
+            log("NON-STREAM", "Reading full response...");
             let buffer = "";
+            
+            // Các biến để lưu kết quả cuối cùng
             let finalContent = "";
             let finalThinking = "";
             let searchLogs = "";
@@ -272,29 +278,39 @@ const server = serve({
                             const event = data.event;
                             if (!event) continue;
 
-                            // Update Final Content (Longcat sends accumulated text)
+                            // 1. CONTENT: Longcat gửi văn bản tích lũy, nên ta chỉ cần lấy giá trị mới nhất
                             if (event.type === "content" && typeof event.content === "string") {
                                 finalContent = event.content;
                             }
+                            
+                            // 2. THINKING: Tương tự, lấy giá trị tích lũy mới nhất
                             if (event.type === "think" && typeof event.content === "string") {
                                 finalThinking = event.content;
                             }
+
+                            // 3. SEARCH: Gom log lại
                             if (event.type === "search" && event.content) {
-                                if (event.content.query) searchLogs += `🔍 Searching: ${event.content.query}\n`;
-                                else if (Array.isArray(event.content.resultList)) {
-                                    event.content.resultList.slice(0,5).forEach((item: any, i: number) => {
-                                        searchLogs += `[${i+1}] ${item.title} (${item.url})\n`;
-                                    });
-                                    searchLogs += "\n";
+                                if (event.content.query) {
+                                    searchLogs += `🔍 Searching: ${event.content.query}\n`;
+                                } else if (Array.isArray(event.content.resultList)) {
+                                     event.content.resultList.slice(0, 5).forEach((item: any, i: number) => {
+                                         searchLogs += `[${i+1}] ${item.title} (${item.url})\n`;
+                                     });
+                                     searchLogs += "\n";
                                 }
                             }
-                        } catch (e) {}
+
+                        } catch (e) {
+                             // Bỏ qua lỗi parse JSON dòng rác
+                        }
                     }
                 }
             }
 
-            log("NON-STREAM", "Finished. Sending JSON.");
-            const combinedReasoning = (searchLogs ? searchLogs + "\n" : "") + finalThinking;
+            log("NON-STREAM", "Done reading. Sending JSON response.");
+
+            // Ghép Search và Thinking vào reasoning_content
+            const combinedReasoning = (searchLogs ? searchLogs + "\n\n" : "") + finalThinking;
 
             return new Response(JSON.stringify({
                 id: generateId(),
@@ -305,14 +321,23 @@ const server = serve({
                     index: 0,
                     message: {
                         role: "assistant",
-                        // FIX: Đảm bảo content luôn là string, không được null/undefined
+                        // Quan trọng: Phải đảm bảo không trả về null/undefined gây crash client
                         content: finalContent || "", 
                         reasoning_content: combinedReasoning || null
                     },
                     finish_reason: "stop"
                 }],
-                usage: { prompt_tokens: 0, completion_tokens: finalContent.length, total_tokens: finalContent.length }
-            }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+                usage: { 
+                    prompt_tokens: 0, 
+                    completion_tokens: finalContent.length, 
+                    total_tokens: finalContent.length 
+                }
+            }), { 
+                headers: { 
+                    "Content-Type": "application/json", 
+                    "Access-Control-Allow-Origin": "*" 
+                } 
+            });
         }
 
       } catch (error) {
@@ -325,4 +350,4 @@ const server = serve({
   },
 });
 
-console.log(`🦊 Bun Longcat Proxy (Stable) running on http://localhost:${PORT}`);
+console.log(`🦊 Bun Proxy (Headers Match) running on http://localhost:${PORT}`);
