@@ -5,15 +5,6 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.SERVER_API_KEY;
 const TARGET_URL = "https://longcat.chat/api/v1/chat-completion-oversea";
 
-// --- Debug ---
-const DEBUG = true; // Set false khi chạy production để bớt rác log
-function log(tag: string, ...args: any[]) {
-  if (DEBUG) {
-    const time = new Date().toISOString().split("T")[1].replace("Z", "");
-    console.log(`[${time}][${tag}]`, ...args);
-  }
-}
-
 // --- Headers ---
 const HEADERS = {
   "authority": "longcat.chat",
@@ -44,7 +35,6 @@ const AVAILABLE_MODELS = [
 
 // --- Helpers ---
 function createErrorResponse(status: number, message: string) {
-  log("ERROR", `Status: ${status} | Msg: ${message}`);
   return new Response(JSON.stringify({ error: { message, type: "server_error" } }), {
     status,
     headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -119,8 +109,6 @@ const server = serve({
         const isStream = body.stream === true;
         const model = body.model || "longcat-flash"; 
 
-        log("REQ", `Model: ${model} | Stream: ${isStream}`);
-
         const response = await fetch(TARGET_URL, {
           method: "POST",
           headers: HEADERS,
@@ -128,8 +116,6 @@ const server = serve({
         });
 
         if (!response.ok) {
-          const text = await response.text();
-          log("UPSTREAM_FAIL", `${response.status} - ${text.substring(0, 100)}`);
           return createErrorResponse(response.status, `Upstream Error: ${response.statusText}`);
         }
 
@@ -137,7 +123,7 @@ const server = serve({
         if (!reader) throw new Error("No body");
         const decoder = new TextDecoder();
 
-        // --- XỬ LÝ STREAM (Chế độ gõ chữ) ---
+        // --- STREAM HANDLER ---
         if (isStream) {
           const { readable, writable } = new TransformStream();
           const writer = writable.getWriter();
@@ -181,6 +167,7 @@ const server = serve({
                           const fullContent = event.content;
                           let delta = "";
                           if (fullContent.length < lastContent.length) lastContent = "";
+                          
                           if (fullContent.startsWith(lastContent)) delta = fullContent.substring(lastContent.length);
                           else delta = fullContent;
                           
@@ -195,6 +182,7 @@ const server = serve({
                           const fullThinking = event.content;
                           let delta = "";
                           if (fullThinking.length < lastThinking.length) lastThinking = "";
+
                           if (fullThinking.startsWith(lastThinking)) delta = fullThinking.substring(lastThinking.length);
                           else delta = fullThinking;
 
@@ -206,13 +194,13 @@ const server = serve({
                       }
                       // 3. Search
                       else if (event.type === "search" && event.content) {
-                           // (Logic search giống cũ)
                            const searchContent = event.content;
                            let searchLog = "";
                            if (searchContent.query) searchLog = `\n🔍 **Searching:** *${searchContent.query}*\n\n`;
                            else if (Array.isArray(searchContent.resultList)) {
                                searchContent.resultList.slice(0,5).forEach((item:any, idx:number) => {
-                                   searchLog += `> ${idx+1}. [${item.title}](${item.url})\n`;
+                                   const snippet = item.snippet ? ` - *"${item.snippet.substring(0, 50)}..."*` : "";
+                                   searchLog += `> ${idx+1}. [${item.title || "Link"}](${item.url})${snippet}\n`;
                                });
                                searchLog += "\n---\n\n";
                            }
@@ -242,7 +230,7 @@ const server = serve({
                 }
               }
             } catch (err) {
-              log("STREAM_ERR", err);
+              // Silent error in production
             } finally {
               await writer.close();
             }
@@ -251,16 +239,13 @@ const server = serve({
           return new Response(readable, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*" } });
         } 
         
-        // --- XỬ LÝ NON-STREAM (Chế độ chờ trả hết) ---
+        // --- NON-STREAM HANDLER (Accumulate All) ---
         else {
             let buffer = "";
             let finalContent = "";
             let finalThinking = "";
             let searchLogs = "";
 
-            log("NON_STREAM", "Accumulating response...");
-
-            // Vòng lặp đọc hết Stream từ Longcat
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -278,21 +263,25 @@ const server = serve({
                             const event = data.event;
                             if (!event) continue;
 
-                            // Cập nhật nội dung mới nhất
+                            // A. Content (Last one wins because it's accumulated)
                             if (event.type === "content" && typeof event.content === "string") {
                                 finalContent = event.content;
                             }
+                            // B. Thinking (Last one wins)
                             if (event.type === "think" && typeof event.content === "string") {
                                 finalThinking = event.content;
                             }
+                            // C. Search (Aggregate lists)
                             if (event.type === "search" && event.content) {
                                 if (event.content.query) {
-                                    searchLogs += `🔍 Searching: ${event.content.query}\n`;
+                                    searchLogs += `> 🔍 **Searching:** *${event.content.query}*\n\n`;
                                 } else if (Array.isArray(event.content.resultList)) {
-                                     event.content.resultList.slice(0,3).forEach((item:any, i:number) => {
-                                         searchLogs += `[${i+1}] ${item.title} (${item.url})\n`;
+                                     searchLogs += `> **Search Results:**\n`;
+                                     event.content.resultList.slice(0,5).forEach((item:any, i:number) => {
+                                         const snippet = item.snippet ? ` - "${item.snippet.substring(0, 100)}..."` : "";
+                                         searchLogs += `> ${i+1}. [${item.title}](${item.url})${snippet}\n`;
                                      });
-                                     searchLogs += "\n";
+                                     searchLogs += "\n---\n";
                                 }
                             }
                         } catch (e) {}
@@ -300,12 +289,8 @@ const server = serve({
                 }
             }
             
-            log("NON_STREAM", "Done. Sending JSON.");
-
-            // Ghép Search vào Reasoning nếu có
-            if (searchLogs) {
-                finalThinking = searchLogs + "\n" + finalThinking;
-            }
+            // Combine Search + Thinking for the final output
+            const combinedReasoning = (searchLogs ? searchLogs + "\n" : "") + finalThinking;
 
             return new Response(JSON.stringify({
                 id: generateId(),
@@ -316,8 +301,8 @@ const server = serve({
                     index: 0,
                     message: {
                         role: "assistant",
-                        content: finalContent || "", // Đảm bảo không undefined
-                        reasoning_content: finalThinking || null // DeepSeek style
+                        content: finalContent || "",
+                        reasoning_content: combinedReasoning || null 
                     },
                     finish_reason: "stop"
                 }],
@@ -332,7 +317,6 @@ const server = serve({
         }
 
       } catch (error) {
-        log("INTERNAL_ERR", error);
         return createErrorResponse(500, "Internal Server Error");
       }
     }
@@ -341,4 +325,4 @@ const server = serve({
   },
 });
 
-console.log(`🦊 Bun Proxy (All Modes) running on http://localhost:${PORT}`);
+console.log(`🦊 Bun Longcat Proxy running on http://localhost:${PORT}`);
